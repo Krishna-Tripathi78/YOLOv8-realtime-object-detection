@@ -1,6 +1,6 @@
 # 🧠 YOLOv8 Real-Time Object Detection 🚀  
 **Author**: Krishna Tripathi  
-[![LinkedIn]()  
+[![LinkedIn](https://www.linkedin.com/in/krishna-tripathi-9aa494303/)  
 [![GitHub]()
 
 ---
