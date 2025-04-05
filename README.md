@@ -1,9 +1,6 @@
 # 🧠 YOLOv8 Real-Time Object Detection 🚀  
 **Author**: Krishna Tripathi  
-[![LinkedIn](https://www.linkedin.com/in/krishna-tripathi-9aa494303/)  
-[![GitHub]()
 
----
 
 ## 📌 Overview  
 This project demonstrates a **real-time object detection system** using [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics) and OpenCV. It detects common objects (bags, bottles, laptops, etc.) from webcam input in real-time with high accuracy and optimized performance — even on CPU-based systems.
