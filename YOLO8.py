@@ -1,15 +1,13 @@
 import cv2
 import os
-import time
 import numpy as np
-from collections import defaultdict, deque
 from ultralytics import YOLO
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
-from queue import Queue
+import time
 
-class AdvancedYOLO:
+class YOLODetector:
     def __init__(self):
         self.models = {
             'nano': 'yolov8n.pt',
@@ -19,178 +17,248 @@ class AdvancedYOLO:
         }
         self.current_model = None
         self.cap = None
-        self.tracking_history = defaultdict(deque)
-        self.object_counts = defaultdict(int)
-        self.fps_counter = deque(maxlen=30)
-        self.detection_zones = []
-        self.alerts = []
         self.running = False
-        self.prev_detections = []
-        self.smooth_factor = 0.7
+        self.conf_threshold = 0.5
         
-    def load_model(self, model_size='nano'):
-        self.current_model = YOLO(self.models[model_size])
-        
-
+    def load_model(self, model_size='medium'):
+        """Load YOLO model"""
+        try:
+            model_path = self.models.get(model_size, 'yolov8m.pt')
+            self.current_model = YOLO(model_path)
+            print(f"✅ Loaded {model_size} model successfully")
+            return True
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            try:
+                self.current_model = YOLO('yolov8n.pt')
+                print("✅ Fallback to nano model")
+                return True
+            except:
+                return False
     
-
-    
-    def process_video(self, source, model_size='nano', save_output=False, enable_tracking=True):
-        self.load_model(model_size)
-        self.cap = cv2.VideoCapture(source)
+    def detect_objects(self, frame):
+        """Run object detection on frame"""
+        if self.current_model is None:
+            return frame, []
         
-        if not self.cap.isOpened():
+        try:
+            results = self.current_model(frame, conf=self.conf_threshold, verbose=False)
+            detections = []
+            
+            for r in results:
+                if r.boxes is not None:
+                    boxes = r.boxes.xyxy.cpu().numpy()
+                    classes = r.boxes.cls.cpu().numpy()
+                    confs = r.boxes.conf.cpu().numpy()
+                    
+                    for box, cls, conf in zip(boxes, classes, confs):
+                        x1, y1, x2, y2 = map(int, box)
+                        label = self.current_model.names[int(cls)]
+                        detections.append({
+                            'box': (x1, y1, x2, y2),
+                            'label': label,
+                            'confidence': float(conf)
+                        })
+            
+            return self.draw_detections(frame, detections), detections
+        except Exception as e:
+            print(f"Detection error: {e}")
+            return frame, []
+    
+    def draw_detections(self, frame, detections):
+        """Draw bounding boxes and labels"""
+        for det in detections:
+            x1, y1, x2, y2 = det['box']
+            label = det['label']
+            conf = det['confidence']
+            
+            # Color based on confidence
+            if conf > 0.7:
+                color = (0, 255, 0)  # Green
+            elif conf > 0.5:
+                color = (0, 255, 255)  # Yellow
+            else:
+                color = (0, 165, 255)  # Orange
+            
+            # Draw box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label
+            text = f"{label} {conf:.2f}"
+            (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1-text_h-10), (x1+text_w, y1), color, -1)
+            cv2.putText(frame, text, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        
+        return frame
+    
+    def process_webcam(self, model_size='medium', save_output=False):
+        """Process webcam feed"""
+        if not self.load_model(model_size):
             return False
         
-        # Get original video properties
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            print("❌ Cannot open webcam")
+            return False
+        
+        # Set webcam properties
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
+        out = None
+        if save_output:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter('webcam_output.mp4', fourcc, 20.0, (1280, 720))
+        
+        cv2.namedWindow("YOLO Webcam Detection", cv2.WINDOW_NORMAL)
+        self.running = True
+        frame_count = 0
+        
+        print("🎥 Webcam detection started. Press 'q' to quit, 's' to save frame")
+        
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            frame_count += 1
+            processed_frame, detections = self.detect_objects(frame)
+            
+            # Add info overlay
+            info_text = f"Frame: {frame_count} | Objects: {len(detections)} | Press 'q' to quit"
+            cv2.putText(processed_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            cv2.imshow("YOLO Webcam Detection", processed_frame)
+            
+            if save_output and out:
+                out.write(processed_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                filename = f"webcam_frame_{frame_count}.jpg"
+                cv2.imwrite(filename, processed_frame)
+                print(f"💾 Saved: {filename}")
+        
+        self.cleanup(out)
+        print(f"✅ Webcam detection completed. Processed {frame_count} frames")
+        return True
+    
+    def process_video(self, video_path, model_size='medium', save_output=False):
+        """Process video file"""
+        if not self.load_model(model_size):
+            return False
+        
+        if not os.path.exists(video_path):
+            print(f"❌ Video file not found: {video_path}")
+            return False
+        
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            print(f"❌ Cannot open video: {video_path}")
+            return False
+        
+        # Get video properties
         fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        print(f"Processing video: {width}x{height} at {fps} FPS, Total frames: {total_frames}")
-        
         out = None
         if save_output:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter('complete_detection.mp4', fourcc, fps, (width, height))
+            output_name = f"processed_{os.path.basename(video_path)}"
+            out = cv2.VideoWriter(output_name, fourcc, fps, (width, height))
         
-        cv2.namedWindow("Complete YOLO Detection", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("YOLO Video Detection", cv2.WINDOW_NORMAL)
         self.running = True
-        
         frame_count = 0
-        total_objects = 0
-        unique_objects = set()
-        detection_log = []
+        
+        print(f"🎬 Processing video: {os.path.basename(video_path)}")
+        print("Press 'q' to quit, 's' to save frame, 'p' to pause")
         
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
-                print("\nVideo processing complete!")
                 break
-                
+            
             frame_count += 1
-            original_frame = frame.copy()
+            processed_frame, detections = self.detect_objects(frame)
             
-            # Multiple detection passes for complete coverage
-            all_detections = []
+            # Add progress info
+            progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+            info_text = f"Frame: {frame_count}/{total_frames} ({progress:.1f}%) | Objects: {len(detections)}"
+            cv2.putText(processed_frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
-            # Pass 1: Standard detection
-            results1 = self.current_model(frame, conf=0.15, iou=0.4, verbose=False)
-            
-            # Pass 2: Enhanced detection with different settings
-            results2 = self.current_model(frame, conf=0.3, iou=0.5, agnostic_nms=True, verbose=False)
-            
-            # Combine results from both passes
-            for results in [results1, results2]:
-                for r in results:
-                    if r.boxes is not None:
-                        boxes = r.boxes.xyxy.cpu().numpy()
-                        classes = r.boxes.cls.cpu().numpy()
-                        confs = r.boxes.conf.cpu().numpy()
-                        
-                        for box, cls, conf in zip(boxes, classes, confs):
-                            x1, y1, x2, y2 = map(int, box)
-                            label = self.current_model.names[int(cls)]
-                            
-                            # Avoid duplicate detections
-                            detection_key = f"{label}_{x1}_{y1}_{x2}_{y2}"
-                            if detection_key not in [d[4] for d in all_detections]:
-                                all_detections.append((x1, y1, x2, y2, detection_key, label, conf))
-            
-            # Process and display all detections
-            objects_in_frame = len(all_detections)
-            
-            for x1, y1, x2, y2, detection_key, label, conf in all_detections:
-                unique_objects.add(label)
-                
-                # Enhanced color coding
-                if conf > 0.8:
-                    color = (0, 255, 0)  # Bright green - very confident
-                    thickness = 4
-                elif conf > 0.6:
-                    color = (0, 255, 255)  # Yellow - confident
-                    thickness = 3
-                elif conf > 0.4:
-                    color = (0, 165, 255)  # Orange - moderate
-                    thickness = 2
-                else:
-                    color = (255, 0, 255)  # Magenta - low confidence
-                    thickness = 2
-                
-                # Draw detection box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                
-                # Enhanced label with better visibility
-                label_text = f"{label} {conf:.2f}"
-                (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                
-                # Label background
-                cv2.rectangle(frame, (x1, y1-text_height-15), (x1+text_width+10, y1), color, -1)
-                cv2.putText(frame, label_text, (x1+5, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                
-                # Log detection
-                detection_log.append(f"Frame {frame_count}: {label} (conf: {conf:.2f})")
-            
-            total_objects += objects_in_frame
-            progress = (frame_count / total_frames) * 100
-            
-            # Comprehensive info display
-            info_bg_height = 80
-            cv2.rectangle(frame, (10, 10), (700, 10+info_bg_height), (0, 0, 0), -1)
-            
-            info_lines = [
-                f"Frame: {frame_count}/{total_frames} ({progress:.1f}%)",
-                f"Objects in frame: {objects_in_frame} | Total detected: {total_objects}",
-                f"Unique object types: {len(unique_objects)} | Types: {', '.join(list(unique_objects)[:5])}"
-            ]
-            
-            for i, line in enumerate(info_lines):
-                cv2.putText(frame, line, (15, 30 + i*20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            cv2.imshow("Complete YOLO Detection", frame)
+            cv2.imshow("YOLO Video Detection", processed_frame)
             
             if save_output and out:
-                out.write(frame)
+                out.write(processed_frame)
             
-            # Progress feedback
-            if frame_count % 30 == 0:
-                print(f"Progress: {progress:.1f}% - Frame {frame_count}/{total_frames} - Objects: {objects_in_frame}")
-            
-            # Control playback
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
             elif key == ord('s'):
-                cv2.imwrite(f'frame_{frame_count}.jpg', frame)
-                print(f"Saved frame {frame_count} with {objects_in_frame} objects")
+                filename = f"video_frame_{frame_count}.jpg"
+                cv2.imwrite(filename, processed_frame)
+                print(f"💾 Saved: {filename}")
             elif key == ord('p'):
-                print("Paused - Press any key to continue")
+                print("⏸️ Paused - press any key to continue")
                 cv2.waitKey(0)
-            elif key == ord('f'):  # Fast forward
-                for _ in range(10):
-                    self.cap.read()
-                    frame_count += 10
-        
-        # Final summary
-        print(f"\n=== DETECTION COMPLETE ===")
-        print(f"Total frames processed: {frame_count}")
-        print(f"Total objects detected: {total_objects}")
-        print(f"Unique object types found: {len(unique_objects)}")
-        print(f"Object types: {', '.join(unique_objects)}")
-        print(f"Average objects per frame: {total_objects/frame_count:.2f}")
-        
-        # Save detection log
-        with open('detection_log.txt', 'w') as f:
-            f.write("\n".join(detection_log))
-        print("Detection log saved to 'detection_log.txt'")
         
         self.cleanup(out)
+        print(f"✅ Video processing completed. Processed {frame_count}/{total_frames} frames")
         return True
     
-
+    def process_image(self, image_path, model_size='medium', save_output=True):
+        """Process single image"""
+        if not self.load_model(model_size):
+            return False
+        
+        if not os.path.exists(image_path):
+            print(f"❌ Image file not found: {image_path}")
+            return False
+        
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"❌ Cannot load image: {image_path}")
+            return False
+        
+        print(f"📸 Processing image: {os.path.basename(image_path)}")
+        
+        processed_image, detections = self.detect_objects(image)
+        
+        # Add detection info
+        height, width = image.shape[:2]
+        info_text = f"Objects detected: {len(detections)} | Image: {width}x{height}"
+        cv2.putText(processed_image, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Display results
+        cv2.namedWindow("YOLO Image Detection", cv2.WINDOW_NORMAL)
+        cv2.imshow("YOLO Image Detection", processed_image)
+        
+        if save_output:
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            output_name = f"{base_name}_detected.jpg"
+            cv2.imwrite(output_name, processed_image)
+            print(f"💾 Saved: {output_name}")
+        
+        # Print detection details
+        if detections:
+            print(f"\n📋 Detection Results:")
+            for i, det in enumerate(detections, 1):
+                print(f"{i}. {det['label']}: {det['confidence']:.3f}")
+        else:
+            print("No objects detected")
+        
+        print("Press any key to close")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        return True
     
     def cleanup(self, out=None):
+        """Clean up resources"""
         if self.cap:
             self.cap.release()
         if out:
@@ -200,110 +268,183 @@ class AdvancedYOLO:
 
 class YOLOGui:
     def __init__(self):
-        self.yolo = AdvancedYOLO()
+        self.detector = YOLODetector()
         self.root = tk.Tk()
-        self.root.title("Advanced YOLO Detection System")
-        self.root.geometry("500x400")
+        self.root.title("YOLOv8 Object Detection System")
+        self.root.geometry("600x700")
+        self.root.configure(bg='#2c3e50')
         self.setup_gui()
         
     def setup_gui(self):
-        # Model selection
-        ttk.Label(self.root, text="Model Size:").pack(pady=5)
-        self.model_var = tk.StringVar(value="small")
-        ttk.Combobox(self.root, textvariable=self.model_var, 
-                    values=["nano", "small", "medium", "large"]).pack(pady=5)
+        # Title
+        title_label = tk.Label(self.root, text="🧠 YOLOv8 Detection System 🚀", 
+                              font=('Arial', 20, 'bold'), fg='#ecf0f1', bg='#2c3e50')
+        title_label.pack(pady=20)
         
-        # Source selection
-        ttk.Label(self.root, text="Video Source:").pack(pady=5)
-        ttk.Button(self.root, text="Use Webcam", command=self.use_webcam).pack(pady=5)
-        ttk.Button(self.root, text="Browse Videos Folder", command=self.browse_videos_folder).pack(pady=5)
-        ttk.Button(self.root, text="Select Video File", command=self.select_file).pack(pady=5)
+        # Model Selection Frame
+        model_frame = tk.LabelFrame(self.root, text="Model Configuration", 
+                                   bg='#34495e', fg='#ecf0f1', font=('Arial', 12, 'bold'))
+        model_frame.pack(fill='x', padx=20, pady=10)
         
-        # Options
-        self.tracking_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(self.root, text="Enable Object Tracking", variable=self.tracking_var).pack(pady=5)
+        tk.Label(model_frame, text="Model Size:", bg='#34495e', fg='#ecf0f1', 
+                font=('Arial', 10)).pack(side='left', padx=10)
+        
+        self.model_var = tk.StringVar(value="medium")
+        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var, 
+                                  values=["nano", "small", "medium", "large"], 
+                                  state="readonly", width=15)
+        model_combo.pack(side='left', padx=10, pady=10)
+        
+        tk.Label(model_frame, text="Confidence:", bg='#34495e', fg='#ecf0f1', 
+                font=('Arial', 10)).pack(side='left', padx=(20,5))
+        
+        self.conf_var = tk.DoubleVar(value=0.5)
+        conf_scale = tk.Scale(model_frame, from_=0.1, to=0.9, resolution=0.1,
+                             orient='horizontal', variable=self.conf_var, 
+                             bg='#34495e', fg='#ecf0f1', length=150)
+        conf_scale.pack(side='left', padx=10, pady=10)
+        
+        # Source Selection Frame
+        source_frame = tk.LabelFrame(self.root, text="Input Source Selection", 
+                                    bg='#34495e', fg='#ecf0f1', font=('Arial', 12, 'bold'))
+        source_frame.pack(fill='x', padx=20, pady=10)
+        
+        # Source buttons
+        btn_frame = tk.Frame(source_frame, bg='#34495e')
+        btn_frame.pack(pady=15)
+        
+        tk.Button(btn_frame, text="📹 Select Webcam", command=self.select_webcam,
+                 bg='#3498db', fg='white', font=('Arial', 11, 'bold'), 
+                 width=20, pady=5).pack(pady=5)
+        
+        tk.Button(btn_frame, text="🎬 Select Video File", command=self.select_video,
+                 bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), 
+                 width=20, pady=5).pack(pady=5)
+        
+        tk.Button(btn_frame, text="🖼️ Select Image File", command=self.select_image,
+                 bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), 
+                 width=20, pady=5).pack(pady=5)
+        
+        # Status
+        self.status_var = tk.StringVar(value="No source selected")
+        status_label = tk.Label(source_frame, textvariable=self.status_var, 
+                               bg='#34495e', fg='#2ecc71', font=('Arial', 11, 'bold'))
+        status_label.pack(pady=10)
+        
+        # Options Frame
+        options_frame = tk.LabelFrame(self.root, text="Options", 
+                                     bg='#34495e', fg='#ecf0f1', font=('Arial', 12, 'bold'))
+        options_frame.pack(fill='x', padx=20, pady=10)
         
         self.save_var = tk.BooleanVar()
-        ttk.Checkbutton(self.root, text="Save Output Video", variable=self.save_var).pack(pady=5)
+        tk.Checkbutton(options_frame, text="💾 Save Output", variable=self.save_var,
+                      bg='#34495e', fg='#ecf0f1', selectcolor='#34495e', 
+                      font=('Arial', 10)).pack(pady=10)
         
-        # Control buttons
-        ttk.Button(self.root, text="Start Detection", command=self.start_detection).pack(pady=10)
-        ttk.Button(self.root, text="Stop Detection", command=self.stop_detection).pack(pady=5)
+        # Control Buttons Frame
+        control_frame = tk.LabelFrame(self.root, text="🎯 Detection Controls", 
+                                     bg='#34495e', fg='#ecf0f1', font=('Arial', 14, 'bold'))
+        control_frame.pack(fill='x', padx=20, pady=20)
         
+        # Main control buttons
+        tk.Button(control_frame, text="🚀 START DETECTION", command=self.start_detection,
+                 bg='#27ae60', fg='white', font=('Arial', 14, 'bold'), 
+                 width=25, pady=10).pack(pady=10)
+        
+        tk.Button(control_frame, text="⏹️ STOP DETECTION", command=self.stop_detection,
+                 bg='#e74c3c', fg='white', font=('Arial', 14, 'bold'), 
+                 width=25, pady=10).pack(pady=10)
+        
+        # Help Frame
+        help_frame = tk.LabelFrame(self.root, text="Keyboard Controls", 
+                                  bg='#34495e', fg='#ecf0f1', font=('Arial', 11, 'bold'))
+        help_frame.pack(fill='x', padx=20, pady=10)
+        
+        help_text = "Q: Quit | S: Save Frame | P: Pause/Resume (video only)"
+        tk.Label(help_frame, text=help_text, bg='#34495e', fg='#bdc3c7', 
+                font=('Arial', 9)).pack(pady=5)
+        
+        # Footer
+        footer = tk.Label(self.root, text="Made by Krishna Tripathi | B.Tech Cyber Security", 
+                         font=('Arial', 10, 'italic'), fg='#95a5a6', bg='#2c3e50')
+        footer.pack(pady=20)
+        
+        # Initialize variables
         self.source = None
+        self.source_type = None
         
-    def use_webcam(self):
+    def select_webcam(self):
         self.source = 0
-        messagebox.showinfo("Source Selected", "Webcam selected as video source")
+        self.source_type = 'webcam'
+        self.status_var.set("✅ Webcam selected")
         
-    def browse_videos_folder(self):
-        videos_dir = os.path.join(os.path.dirname(__file__), "videos")
-        if not os.path.exists(videos_dir):
-            os.makedirs(videos_dir)
-            messagebox.showinfo("Info", f"Created videos folder at: {videos_dir}\nAdd your video files there!")
-            return
-            
-        video_files = [f for f in os.listdir(videos_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))]
-        
-        if not video_files:
-            messagebox.showinfo("No Videos", f"No video files found in: {videos_dir}\nAdd some video files to this folder!")
-            return
-            
-        # Create selection window
-        selection_window = tk.Toplevel(self.root)
-        selection_window.title("Select Video from Folder")
-        selection_window.geometry("400x300")
-        
-        ttk.Label(selection_window, text="Available Videos:").pack(pady=10)
-        
-        listbox = tk.Listbox(selection_window, height=10)
-        listbox.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
-        
-        for video in video_files:
-            listbox.insert(tk.END, video)
-            
-        def select_video():
-            selection = listbox.curselection()
-            if selection:
-                selected_video = video_files[selection[0]]
-                self.source = os.path.join(videos_dir, selected_video)
-                messagebox.showinfo("Source Selected", f"Video selected: {selected_video}")
-                selection_window.destroy()
-            else:
-                messagebox.showwarning("No Selection", "Please select a video file")
-                
-        ttk.Button(selection_window, text="Select", command=select_video).pack(pady=10)
-        ttk.Button(selection_window, text="Cancel", command=selection_window.destroy).pack(pady=5)
-    
-    def select_file(self):
+    def select_video(self):
         file_path = filedialog.askopenfilename(
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv")]
+            title="Select Video File",
+            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*.*")]
         )
         if file_path:
             self.source = file_path
-            messagebox.showinfo("Source Selected", f"Video file selected: {os.path.basename(file_path)}")
+            self.source_type = 'video'
+            filename = os.path.basename(file_path)
+            self.status_var.set(f"✅ Video: {filename}")
+    
+    def select_image(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Image File",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.source = file_path
+            self.source_type = 'image'
+            filename = os.path.basename(file_path)
+            self.status_var.set(f"✅ Image: {filename}")
     
     def start_detection(self):
         if self.source is None:
-            messagebox.showerror("Error", "Please select a video source first")
+            messagebox.showerror("Error", "Please select a source first!")
             return
-            
-        def run_detection():
-            self.yolo.process_video(
-                self.source,
-                self.model_var.get(),
-                self.save_var.get(),
-                self.tracking_var.get()
-            )
         
+        # Update detector settings
+        self.detector.conf_threshold = self.conf_var.get()
+        model_size = self.model_var.get()
+        save_output = self.save_var.get()
+        
+        def run_detection():
+            try:
+                if self.source_type == 'webcam':
+                    self.detector.process_webcam(model_size, save_output)
+                elif self.source_type == 'video':
+                    self.detector.process_video(self.source, model_size, save_output)
+                elif self.source_type == 'image':
+                    self.detector.process_image(self.source, model_size, save_output)
+            except Exception as e:
+                messagebox.showerror("Error", f"Detection failed: {str(e)}")
+        
+        # Run in separate thread
         threading.Thread(target=run_detection, daemon=True).start()
     
     def stop_detection(self):
-        self.yolo.running = False
+        self.detector.running = False
+        messagebox.showinfo("Info", "Detection stopped")
         
     def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
+    
+    def on_closing(self):
+        self.detector.running = False
+        self.detector.cleanup()
+        self.root.destroy()
 
 if __name__ == "__main__":
-    app = YOLOGui()
-    app.run()
+    try:
+        print("🚀 Starting YOLOv8 Detection System...")
+        app = YOLOGui()
+        app.run()
+    except KeyboardInterrupt:
+        print("\n⏹️ Application interrupted by user")
+    except Exception as e:
+        print(f"❌ Application error: {e}")
+    finally:
+        cv2.destroyAllWindows()
